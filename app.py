@@ -1,5 +1,6 @@
 import os
 import random
+import joblib
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -15,6 +16,7 @@ st.set_page_config(page_title="ICU Sepsis Admission Risk Triage & GenAI Copilot"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = "/home/aakash/cllg/SD/s3/mp" if os.path.exists("/home/aakash/cllg/SD/s3/mp") else BASE_DIR
 
+BUNDLE_PATH = os.path.join(DATA_DIR, "sepsis_triage_bundle.joblib")
 HOSP_A_CSV = os.path.join(DATA_DIR, "hospital_A_cleaned.csv")
 HOSP_B_10_CSV = os.path.join(DATA_DIR, "hospital_B_10pct.csv")
 HOSP_B_50_CSV = os.path.join(DATA_DIR, "hospital_B_50pct.csv")
@@ -257,6 +259,19 @@ def clinical_context_for_feature(feat_name):
 def load_and_fit_pipeline():
     metrics_records = []
     triage_tables = {}
+
+    if os.path.exists(BUNDLE_PATH):
+        loaded = joblib.load(BUNDLE_PATH)
+        return {
+            "train_stats": loaded["train_stats"],
+            "feature_columns": loaded["feature_columns"],
+            "calibrated_model": loaded["calibrated_model"],
+            "background_df": loaded["background_df"],
+            "t_low": float(loaded["t_low"]),
+            "t_high": float(loaded["t_high"]),
+            "metrics_df": loaded.get("metrics_df", pd.DataFrame(metrics_records)),
+            "triage_tables": loaded.get("triage_tables", triage_tables),
+        }
 
     if os.path.exists(HOSP_A_CSV):
         df_A = pd.read_csv(HOSP_A_CSV, dtype={"Patient_ID": str})
