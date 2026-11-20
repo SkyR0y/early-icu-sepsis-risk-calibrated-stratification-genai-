@@ -36,6 +36,16 @@ TABLE_COLS = [
 ]
 
 
+def safe_predict_proba_pos(model, X):
+    probs = model.predict_proba(X)
+    if probs.ndim == 1:
+        return np.asarray(probs, dtype=float)
+    if probs.shape[1] == 1:
+        cls = model.classes_[0] if hasattr(model, "classes_") and len(model.classes_) > 0 else 0
+        return np.ones(len(X), dtype=float) if cls == 1 else np.zeros(len(X), dtype=float)
+    return np.asarray(probs[:, 1], dtype=float)
+
+
 def generate_patient_id(existing_ids=None):
     existing = set(str(x) for x in (existing_ids or []))
     for _ in range(500):
@@ -254,23 +264,23 @@ def load_and_fit_pipeline():
         rng = np.random.default_rng(42)
         rows = []
         for pid in range(1, 201):
-            is_sep = int(pid % 10 == 0)
-            for h in range(1, 7):
+            is_sep = int(pid % 5 == 0)
+            for h in range(1, 9):
                 r = {c: np.nan for c in RAW_COLS}
                 r.update({
                     "Patient_ID": f"{pid:06d}",
                     "ICULOS": h,
-                    "SepsisLabel": is_sep if h == 6 else 0,
+                    "SepsisLabel": 1 if (is_sep and h >= 7) else 0,
                     "HospAdmTime": -90.0 if is_sep else -12.0,
                     "Age": 73.0 if is_sep else 56.0,
                     "Gender": 1.0,
                     "Unit1": 1.0,
                     "Unit2": 0.0,
-                    "HR": (112.0 + h * 2 + float(rng.normal(0, 1.5))) if is_sep else 80.0,
-                    "O2Sat": (93.0 - h * 0.5) if is_sep else 98.0,
+                    "HR": (112.0 + min(h, 6) * 2 + float(rng.normal(0, 1.5))) if is_sep else 80.0,
+                    "O2Sat": (93.0 - min(h, 6) * 0.5) if is_sep else 98.0,
                     "Temp": 38.4 if is_sep else 37.0,
-                    "SBP": (102.0 - h * 2) if is_sep else 124.0,
-                    "MAP": (66.0 - h * 1.5) if is_sep else 84.0,
+                    "SBP": (102.0 - min(h, 6) * 2) if is_sep else 124.0,
+                    "MAP": (66.0 - min(h, 6) * 1.5) if is_sep else 84.0,
                     "DBP": 54.0 if is_sep else 68.0,
                     "Resp": 24.0 if is_sep else 16.0,
                     "FiO2": 0.45 if is_sep else 0.21,
@@ -283,8 +293,9 @@ def load_and_fit_pipeline():
         df_A = pd.DataFrame(rows, columns=RAW_COLS)
 
     _, _, X_A, y_A, train_stats_A = build_workstream5_cohort(df_A, is_train=True)
+    strat = y_A if y_A.nunique() > 1 else None
     X_A_tr, X_A_te, y_A_tr, y_A_te = train_test_split(
-        X_A, y_A, test_size=0.20, random_state=42, stratify=y_A
+        X_A, y_A, test_size=0.20, random_state=42, stratify=strat
     )
 
     monotone_dict = {
@@ -299,14 +310,15 @@ def load_and_fit_pipeline():
     )
     calibrated_hgb = CalibratedClassifierCV(estimator=base_hgb, method="isotonic", cv=3)
     calibrated_hgb.fit(X_A_tr, y_A_tr)
-    probs_A_te = calibrated_hgb.predict_proba(X_A_te)[:, 1]
+    probs_A_te = safe_predict_proba_pos(calibrated_hgb, X_A_te)
     p_a, r_a, _ = precision_recall_curve(y_A_te, probs_A_te)
     tab_a, t_low_a, t_high_a = build_triage_summary(y_A_te.values, probs_A_te)
     triage_tables["Hospital A (Holdout)"] = tab_a
+    auroc_a = round(float(roc_auc_score(y_A_te, probs_A_te)), 4) if y_A_te.nunique() > 1 else None
     metrics_records.append({
         "Stage": "Hospital A (Holdout)",
         "AUPRC": round(float(auc(r_a, p_a)), 4),
-        "AUROC": round(float(roc_auc_score(y_A_te, probs_A_te)), 4),
+        "AUROC": auroc_a,
         "Baseline_Prevalence": round(float(y_A_te.mean()), 4),
     })
 
@@ -318,25 +330,27 @@ def load_and_fit_pipeline():
         df_B50 = pd.read_csv(HOSP_B_50_CSV, dtype={"Patient_ID": str})
         _, _, X_B50, y_B50, _ = build_workstream5_cohort(df_B50, is_train=False, train_stats=train_stats_A)
         X_B50 = X_B50.reindex(columns=X_A_tr.columns, fill_value=0)
-        final_calibrated_hgb = CalibratedClassifierCV(estimator=base_hgb, method="isotonic", cv=3)
-        final_calibrated_hgb.fit(X_B50, y_B50)
-        active_model = final_calibrated_hgb
-        background_df = X_B50
+        if y_B50.nunique() > 1:
+            final_calibrated_hgb = CalibratedClassifierCV(estimator=base_hgb, method="isotonic", cv=3)
+            final_calibrated_hgb.fit(X_B50, y_B50)
+            active_model = final_calibrated_hgb
+            background_df = X_B50
 
     if os.path.exists(HOSP_B_100_CSV):
         df_B100 = pd.read_csv(HOSP_B_100_CSV, dtype={"Patient_ID": str})
         _, _, X_B100, y_B100, _ = build_workstream5_cohort(df_B100, is_train=False, train_stats=train_stats_A)
         X_B100 = X_B100.reindex(columns=X_A_tr.columns, fill_value=0)
-        probs_B100 = active_model.predict_proba(X_B100)[:, 1]
+        probs_B100 = safe_predict_proba_pos(active_model, X_B100)
         p_b, r_b, _ = precision_recall_curve(y_B100, probs_B100)
         tab_b, t_low_b, t_high_b = build_triage_summary(y_B100.values, probs_B100)
         triage_tables["Hospital B (100% Release)"] = tab_b
         t_low, t_high = t_low_b, t_high_b
         background_df = X_B100
+        auroc_b = round(float(roc_auc_score(y_B100, probs_B100)), 4) if y_B100.nunique() > 1 else None
         metrics_records.append({
             "Stage": "Hospital B (100% Release)",
             "AUPRC": round(float(auc(r_b, p_b)), 4),
-            "AUROC": round(float(roc_auc_score(y_B100, probs_B100)), 4),
+            "AUROC": auroc_b,
             "Baseline_Prevalence": round(float(y_B100.mean()), 4),
         })
 
@@ -506,7 +520,7 @@ with tab1:
             feat_cols = pipeline["feature_columns"]
             X_aligned = X_new.reindex(columns=feat_cols, fill_value=0)
             model = pipeline["calibrated_model"]
-            prob = float(model.predict_proba(X_aligned)[0, 1])
+            prob = float(safe_predict_proba_pos(model, X_aligned)[0])
             t_low, t_high = pipeline["t_low"], pipeline["t_high"]
 
             if prob < t_low:
@@ -524,7 +538,7 @@ with tab1:
             bg_sample = pipeline["background_df"].reindex(columns=feat_cols, fill_value=0).sample(
                 min(100, len(pipeline["background_df"])), random_state=42
             )
-            explainer = shap.Explainer(lambda x: fitted_est.predict_proba(x)[:, 1], bg_sample)
+            explainer = shap.Explainer(lambda x: safe_predict_proba_pos(fitted_est, x), bg_sample)
             p_shap = explainer(X_aligned).values[0]
 
             shap_df = pd.DataFrame({
